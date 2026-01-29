@@ -2,6 +2,12 @@ const UPSTREAM_ORIGIN = "https://hexdocs.pm";
 const YEAR_TTL_SECONDS = 31_536_000;
 const HOUR_TTL_SECONDS = 3_600;
 
+type OptionEntry = {
+	key: string;
+	required: boolean;
+	type: string;
+};
+
 const parsePathContext = (pathname: string) => {
 	const [packageName, version, ...rest] = pathname.split("/").filter(Boolean);
 	return {
@@ -22,9 +28,7 @@ const markdownResponse = (body: string, ttlSeconds: number, status = 200) =>
 		status,
 		headers: {
 			"content-type": "text/markdown; charset=utf-8",
-			"cache-control": `public, max-age=${ttlSeconds}${
-				ttlSeconds === YEAR_TTL_SECONDS ? ", immutable" : ""
-			}`,
+			"cache-control": `public, max-age=${ttlSeconds}${ttlSeconds === YEAR_TTL_SECONDS ? ", immutable" : ""}`,
 		},
 	});
 
@@ -36,7 +40,7 @@ const buildInstructionHeader = (
 	const base = `${origin}/${packageName}/${version}`;
 	return [
 		"## Navigation + Discovery Instructions",
-		"Follow only the explicit URL patterns below; do not guess or crawl outside them.",
+		"Use the URL patterns below as a shortcut for navigation. Explore as needed; these are hints, not constraints.",
 		"",
 		"```agent-navigation",
 		`WRAPPER_BASE=${origin}`,
@@ -53,11 +57,29 @@ const buildInstructionHeader = (
 		'RELATED_LINKS=See the "Related Links" section at the end of every response.',
 		"```",
 		"",
-		"Steps:",
-		`1. OPEN ${base}/llms.txt and read the Modules and Exceptions lists.`,
-		`2. For each module, GO TO ${base}/{Module}.html#summary to see functions.`,
-		`3. For full details, GO TO ${base}/{Module}.md and scan "Types", "Callbacks", and "Exceptions".`,
-		`4. FOLLOW any URLs in the "Related Links" section to continue discovery.`,
+		"Steps (optional):",
+		`1. START with the current page and follow what looks relevant.`,
+		`2. USE the "Related Pages" section to hop to nearby modules when helpful.`,
+		`3. OPEN ${base}/llms.txt when you want a full module/exception index.`,
+		`4. For function lists, GO TO ${base}/{Module}.html#summary.`,
+		`5. For full details, GO TO ${base}/{Module}.md and scan "Types", "Callbacks", and "Exceptions".`,
+		`6. FOLLOW any URLs in the "Related Links" section to continue discovery.`,
+	].join("\n");
+};
+
+const buildSourceSection = (pageUrl: URL) => {
+	const path = pageUrl.pathname;
+	if (!path.endsWith(".html") && !path.endsWith(".md")) {
+		return null;
+	}
+	const htmlPath = path.endsWith(".html")
+		? path
+		: path.replace(/\.md$/i, ".html");
+	const mdPath = path.endsWith(".md") ? path : path.replace(/\.html$/i, ".md");
+	return [
+		"## Source URLs",
+		`- HTML: ${pageUrl.origin}${htmlPath}`,
+		`- Markdown: ${pageUrl.origin}${mdPath}`,
 	].join("\n");
 };
 
@@ -78,6 +100,40 @@ const decodeHtmlEntities = (input: string) =>
 
 const stripTags = (input: string) =>
 	decodeHtmlEntities(input.replace(/<[^>]*>/g, ""));
+
+const normalizeLinkTarget = (
+	href: string,
+	baseUrl: string,
+	wrapperOrigin: string,
+) => {
+	if (
+		!href ||
+		href.startsWith("#") ||
+		href.startsWith("mailto:") ||
+		href.startsWith("javascript:")
+	) {
+		return href;
+	}
+	try {
+		const resolved = new URL(href, baseUrl);
+		if (resolved.host === "hexdocs.pm") {
+			return `${wrapperOrigin}${resolved.pathname}${resolved.search}${resolved.hash}`;
+		}
+		return resolved.toString();
+	} catch {
+		return href;
+	}
+};
+
+const rewriteMarkdownLinks = (
+	markdown: string,
+	baseUrl: string,
+	wrapperOrigin: string,
+) =>
+	markdown.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, href) => {
+		const normalized = normalizeLinkTarget(href.trim(), baseUrl, wrapperOrigin);
+		return normalized ? `[${label}](${normalized})` : match;
+	});
 
 const htmlToMarkdown = (html: string) => {
 	let output = html;
@@ -122,6 +178,49 @@ const htmlToMarkdown = (html: string) => {
 	return output.replace(/\n{3,}/g, "\n\n").trim();
 };
 
+const extractHtmlCodeBlocks = (html: string) => {
+	const blocks: { language?: string; code: string }[] = [];
+	for (const match of html.matchAll(
+		/<pre[^>]*><code([^>]*)>([\s\S]*?)<\/code><\/pre>/gi,
+	)) {
+		const attrs = match[1] ?? "";
+		const rawCode = match[2] ?? "";
+		const classMatch = attrs.match(/class=["']([^"']+)["']/i);
+		const classes = classMatch?.[1]?.split(/\s+/) ?? [];
+		const language =
+			classes
+				.find((value) => value.startsWith("language-"))
+				?.replace("language-", "") ??
+			classes.find((value) => value && value !== "highlight");
+		blocks.push({
+			language,
+			code: stripTags(rawCode).trim(),
+		});
+	}
+	const unique = new Map<string, { language?: string; code: string }>();
+	for (const block of blocks) {
+		if (block.code) {
+			unique.set(`${block.language ?? "text"}:${block.code}`, block);
+		}
+	}
+	return Array.from(unique.values());
+};
+
+const appendCodeBlocks = (
+	markdown: string,
+	blocks: { language?: string; code: string }[],
+) => {
+	if (!blocks.length) {
+		return markdown;
+	}
+	const lines = ["## Code Blocks"];
+	for (const block of blocks) {
+		const fence = `\`\`\`${block.language ?? ""}`.trimEnd();
+		lines.push([fence, block.code, "```"].join("\n"));
+	}
+	return [markdown, "", lines.join("\n\n")].join("\n");
+};
+
 const resolveRelatedLink = (
 	href: string,
 	baseUrl: string,
@@ -158,6 +257,47 @@ const extractRelatedLinks = (
 		}
 	}
 	return Array.from(links);
+};
+
+const extractModuleName = (markdown: string) => {
+	const headingMatch = markdown.match(/^#\s+`?([^`]+)`?/m);
+	return headingMatch?.[1]?.trim() ?? null;
+};
+
+const extractModuleReferences = (
+	markdown: string,
+	typeOptions: Map<string, OptionEntry[]>,
+) => {
+	const modulePattern =
+		/\b(AI(?:\.[A-Za-z0-9_]+)+|AiSdkEx(?:\.[A-Za-z0-9_]+)+)\b/g;
+	const modules = new Set<string>();
+	for (const match of markdown.matchAll(modulePattern)) {
+		modules.add(match[1]);
+	}
+	for (const options of typeOptions.values()) {
+		for (const option of options) {
+			for (const match of option.type.matchAll(modulePattern)) {
+				modules.add(match[1]);
+			}
+		}
+	}
+	return Array.from(modules);
+};
+
+const renderRelatedPages = (
+	pages: string[],
+	origin: string,
+	packageName: string,
+	version: string,
+) => {
+	if (!pages.length) {
+		return null;
+	}
+	const lines = ["## Related Pages"];
+	for (const page of pages) {
+		lines.push(`- ${origin}/${packageName}/${version}/${page}.html`);
+	}
+	return lines.join("\n");
 };
 
 const renderRelatedLinks = (links: string[]) => {
@@ -211,11 +351,21 @@ const getMarkdownFromPath = async (
 		UPSTREAM_ORIGIN,
 	);
 	if (requestUrl.pathname.endsWith(".md")) {
+		const htmlUrl = new URL(
+			requestUrl.pathname.replace(/\.md$/i, ".html"),
+			UPSTREAM_ORIGIN,
+		);
 		const response = await fetchUpstream(fetcher, upstreamUrl, ttlSeconds);
 		if (!response.ok) {
 			throw new Error(`Upstream markdown fetch failed (${response.status})`);
 		}
-		return response.text();
+		const markdown = await response.text();
+		const htmlResponse = await fetchUpstream(fetcher, htmlUrl, ttlSeconds);
+		if (!htmlResponse.ok) {
+			return markdown;
+		}
+		const html = await htmlResponse.text();
+		return appendCodeBlocks(markdown, extractHtmlCodeBlocks(html));
 	}
 	const htmlResponse = await fetchUpstream(fetcher, upstreamUrl, ttlSeconds);
 	if (!htmlResponse.ok) {
@@ -230,16 +380,17 @@ const getMarkdownFromPath = async (
 			ttlSeconds,
 		);
 		if (markdownResponse.ok) {
-			return markdownResponse.text();
+			const markdown = await markdownResponse.text();
+			return appendCodeBlocks(markdown, extractHtmlCodeBlocks(html));
 		}
 	}
-	return htmlToMarkdown(html);
+	return appendCodeBlocks(htmlToMarkdown(html), extractHtmlCodeBlocks(html));
 };
 
 const parseLlmsEntry = (line: string) => {
 	const content = line.replace(/^-+\s*/, "").trim();
 	const linkMatch = content.match(
-		/^\[([^\]]+)\]\(([^)]+)\)\s*(?:[-–—]\s*)?(.*)$/,
+		/^\[([^\]]+)\]\(([^)]+)\)\s*(?:[:\-–—]\s*)?(.*)$/,
 	);
 	if (linkMatch) {
 		return {
@@ -254,7 +405,13 @@ const parseLlmsEntry = (line: string) => {
 			summary: separatorMatch[2]?.trim(),
 		};
 	}
-	return content ? { name: content, summary: "" } : null;
+	if (!content) {
+		return null;
+	}
+	if (content.includes("[") && content.includes("](")) {
+		return null;
+	}
+	return { name: content, summary: "" };
 };
 
 const normalizeEntryName = (name: string) =>
@@ -288,6 +445,12 @@ const transformLlmsText = (
 			output.push(line);
 			continue;
 		}
+		const trimmed = line.trim();
+		if (/^-\s+exceptions\b/i.test(trimmed)) {
+			section = "exceptions";
+			output.push("## Exceptions");
+			continue;
+		}
 		if (line.trim().startsWith("-") && section) {
 			const entry = parseLlmsEntry(line);
 			if (!entry?.name) {
@@ -304,6 +467,286 @@ const transformLlmsText = (
 		output.push(line);
 	}
 	return output.join("\n").trim();
+};
+
+const parseOptionLine = (line: string) => {
+	const trimmed = line.replace(/,\s*$/, "").trim();
+	if (!trimmed) {
+		return null;
+	}
+	const optionalMatch = trimmed.match(/^optional\(\s*:(\w+)\s*\)\s*=>\s*(.+)$/);
+	if (optionalMatch) {
+		return {
+			key: `:${optionalMatch[1]}`,
+			required: false,
+			type: optionalMatch[2].trim(),
+		};
+	}
+	const requiredArrowMatch = trimmed.match(/^:(\w+)\s*=>\s*(.+)$/);
+	if (requiredArrowMatch) {
+		return {
+			key: `:${requiredArrowMatch[1]}`,
+			required: true,
+			type: requiredArrowMatch[2].trim(),
+		};
+	}
+	const requiredColonMatch = trimmed.match(/^(\w+)\s*:\s*(.+)$/);
+	if (requiredColonMatch) {
+		return {
+			key: `:${requiredColonMatch[1]}`,
+			required: true,
+			type: requiredColonMatch[2].trim(),
+		};
+	}
+	return null;
+};
+
+const parseMapOptions = (lines: string[]) =>
+	lines
+		.map((line) => (line.split("#")[0] ?? "").trim())
+		.map(parseOptionLine)
+		.filter((entry): entry is OptionEntry => Boolean(entry));
+
+const extractCodeBlocks = (markdown: string) => {
+	const blocks: string[] = [];
+	for (const match of markdown.matchAll(/```[^\n]*\n([\s\S]*?)```/g)) {
+		blocks.push(match[1]);
+	}
+	return blocks;
+};
+
+const parseTypeOptions = (markdown: string) => {
+	const optionsByType = new Map<string, OptionEntry[]>();
+	for (const block of extractCodeBlocks(markdown)) {
+		const lines = block.split("\n");
+		for (let i = 0; i < lines.length; i += 1) {
+			const line = lines[i];
+			const typeMatch = line.match(
+				/@type\s+([A-Za-z0-9_]+)\(\)\s*::\s*%{\s*(.*)$/,
+			);
+			if (!typeMatch) {
+				continue;
+			}
+			const typeName = typeMatch[1];
+			const inline = typeMatch[2] ?? "";
+			const mapLines: string[] = [];
+			if (inline.includes("}")) {
+				mapLines.push(inline.split("}")[0]);
+			} else {
+				if (inline.trim()) {
+					mapLines.push(inline);
+				}
+				for (let j = i + 1; j < lines.length; j += 1) {
+					const mapLine = lines[j];
+					if (mapLine.includes("}")) {
+						mapLines.push(mapLine.split("}")[0]);
+						i = j;
+						break;
+					}
+					mapLines.push(mapLine);
+				}
+			}
+			const options = parseMapOptions(mapLines);
+			if (options.length) {
+				optionsByType.set(typeName, options);
+			}
+		}
+	}
+	return optionsByType;
+};
+
+const parseTypeNames = (markdown: string) => {
+	const names = new Set<string>();
+	for (const block of extractCodeBlocks(markdown)) {
+		for (const line of block.split("\n")) {
+			const match = line.match(/@type\s+([A-Za-z0-9_]+)\(\)/);
+			if (match) {
+				names.add(match[1]);
+			}
+		}
+	}
+	return names;
+};
+
+const parseSpecs = (markdown: string) => {
+	const specs = new Map<string, { spec: string; optsType?: string }>();
+	for (const block of extractCodeBlocks(markdown)) {
+		const lines = block.split("\n");
+		for (const line of lines) {
+			const match = line.match(/@spec\s+([a-zA-Z0-9_!?]+)\(([^)]*)\)/);
+			if (!match) {
+				continue;
+			}
+			const fnName = match[1];
+			const args = match[2];
+			const optsMatch = args.match(/([A-Za-z0-9_]+_opts)\(\)/);
+			specs.set(fnName, { spec: line.trim(), optsType: optsMatch?.[1] });
+		}
+	}
+	return specs;
+};
+
+const parseCallbacks = (markdown: string) => {
+	const callbacks = new Set<string>();
+	for (const block of extractCodeBlocks(markdown)) {
+		for (const line of block.split("\n")) {
+			const match = line.match(/@callback\s+([A-Za-z0-9_!?]+)\(/);
+			if (match) {
+				callbacks.add(match[1]);
+			}
+		}
+	}
+	return callbacks;
+};
+
+const insertSectionHeadings = (
+	markdown: string,
+	typeNames: Set<string>,
+	callbackNames: Set<string>,
+) => {
+	const lines = markdown.split("\n");
+	const output: string[] = [];
+	let typesInserted = false;
+	let callbacksInserted = false;
+	let exceptionsInserted = false;
+	for (const line of lines) {
+		const headingMatch = line.match(/^#{1,6}\s+`?([^`]+)`?/);
+		if (headingMatch) {
+			const title = headingMatch[1]?.trim();
+			if (title && typeNames.has(title) && !typesInserted) {
+				output.push("## Types", "");
+				typesInserted = true;
+			}
+			if (title && callbackNames.has(title) && !callbacksInserted) {
+				output.push("## Callbacks", "");
+				callbacksInserted = true;
+			}
+			if (title && !exceptionsInserted && /(Error|Exception)/.test(title)) {
+				output.push("## Exceptions", "");
+				exceptionsInserted = true;
+			}
+		}
+		output.push(line);
+	}
+	return output.join("\n");
+};
+
+const buildOptionsTable = (options: OptionEntry[]) => {
+	const sorted = [...options].sort(
+		(a, b) => Number(b.required) - Number(a.required),
+	);
+	const lines = [
+		"## Options",
+		"| Key | Required | Type |",
+		"| --- | --- | --- |",
+		...sorted.map(
+			(option) =>
+				`| ${option.key} | ${option.required ? "yes" : "no"} | ${option.type} |`,
+		),
+	];
+	return lines.join("\n");
+};
+
+const injectFunctionEnhancements = (
+	markdown: string,
+	optionsByType: Map<string, OptionEntry[]>,
+	specs: Map<string, { spec: string; optsType?: string }>,
+) => {
+	const lines = markdown.split("\n");
+	const output: string[] = [];
+	let pending: {
+		fnName: string;
+		spec?: string;
+		options?: OptionEntry[];
+		inserted: boolean;
+	} | null = null;
+
+	const flushInsertions = () => {
+		if (!pending || pending.inserted) {
+			return;
+		}
+		const insertLines: string[] = [];
+		if (pending.spec) {
+			insertLines.push(`Spec: \`${pending.spec}\``);
+		}
+		if (pending.options?.length) {
+			if (insertLines.length) {
+				insertLines.push("");
+			}
+			insertLines.push(...buildOptionsTable(pending.options).split("\n"));
+		}
+		if (insertLines.length) {
+			output.push(...insertLines);
+			output.push("");
+		}
+		pending.inserted = true;
+	};
+
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i];
+		const headingMatch = line.match(/^#{1,6}\s+`?([A-Za-z0-9_!?]+)`?\s*$/);
+		if (headingMatch) {
+			const fnName = headingMatch[1];
+			const specInfo = specs.get(fnName);
+			const options = specInfo?.optsType
+				? optionsByType.get(specInfo.optsType)
+				: undefined;
+			pending =
+				specInfo || options
+					? { fnName, spec: specInfo?.spec, options, inserted: false }
+					: null;
+			output.push(line);
+			continue;
+		}
+		if (pending) {
+			if (line.startsWith("[🔗](")) {
+				output.push(line);
+				continue;
+			}
+			if (!pending.inserted) {
+				if (line.trim() && !line.startsWith("```") && !line.startsWith("#")) {
+					flushInsertions();
+					output.push(
+						line.trim().startsWith("Summary:")
+							? line.trim()
+							: `Summary: ${line.trim()}`,
+					);
+					pending = null;
+					continue;
+				}
+				flushInsertions();
+			}
+		}
+		output.push(line);
+	}
+	return output.join("\n");
+};
+
+const buildAgentDataSection = (optionsByType: Map<string, OptionEntry[]>) => {
+	const optTypes = Array.from(optionsByType.entries()).filter(([name]) =>
+		name.endsWith("_opts"),
+	);
+	if (!optTypes.length) {
+		return null;
+	}
+	const lines = ["## Agent Data", "```agent-data", "opts:"];
+	for (const [typeName, options] of optTypes) {
+		lines.push(`  ${typeName}:`);
+		const required = options.filter((option) => option.required);
+		const optional = options.filter((option) => !option.required);
+		lines.push("    required:");
+		for (const option of required) {
+			lines.push(`      - key: ${option.key}`);
+			lines.push(`        type: ${option.type}`);
+		}
+		lines.push("    optional:");
+		for (const option of optional) {
+			lines.push(`      - key: ${option.key}`);
+			lines.push(`        type: ${option.type}`);
+		}
+	}
+	lines.push("```");
+	return lines.join("\n");
 };
 
 const buildLlmsReplacement = async (
@@ -352,36 +795,70 @@ export const handleRequest = async (
 		packageName,
 		version,
 	);
+	const sourceSection = buildSourceSection(url);
 	const isLlms = url.pathname.endsWith("/llms.txt");
 	try {
 		if (isLlms) {
-			const llmsBody = await buildLlmsReplacement(url, fetcher, ttlSeconds);
+			const llmsBodyRaw = await buildLlmsReplacement(url, fetcher, ttlSeconds);
+			const llmsBody = rewriteMarkdownLinks(
+				llmsBodyRaw,
+				url.toString(),
+				url.origin,
+			);
 			const relatedLinks = [
 				`${url.origin}/${packageName}/${version}/readme.html`,
 				`${url.origin}/${packageName}/${version}/readme.md`,
 			];
-			const body = [
+			const bodyParts = [
 				instructionHeader,
-				"",
+				sourceSection,
 				llmsBody,
-				"",
 				renderRelatedLinks(relatedLinks),
-			].join("\n");
+			].filter(Boolean);
+			const body = bodyParts.join("\n\n");
 			return markdownResponse(body, ttlSeconds);
 		}
-		const markdown = await getMarkdownFromPath(url, fetcher, ttlSeconds);
-		const relatedLinks = extractRelatedLinks(
-			markdown,
+		const rawMarkdown = await getMarkdownFromPath(url, fetcher, ttlSeconds);
+		const rewritten = rewriteMarkdownLinks(
+			rawMarkdown,
 			url.toString(),
 			url.origin,
 		);
-		const body = [
+		const optionsByType = parseTypeOptions(rewritten);
+		const specs = parseSpecs(rewritten);
+		const callbacks = parseCallbacks(rewritten);
+		const typeNames = parseTypeNames(rewritten);
+		const withSections = insertSectionHeadings(rewritten, typeNames, callbacks);
+		const enhanced = injectFunctionEnhancements(
+			withSections,
+			optionsByType,
+			specs,
+		);
+		const agentData = buildAgentDataSection(optionsByType);
+		const moduleName = extractModuleName(rewritten);
+		const relatedPages = extractModuleReferences(enhanced, optionsByType)
+			.filter((page) => page !== moduleName)
+			.slice(0, 20);
+		const relatedPagesSection = renderRelatedPages(
+			relatedPages,
+			url.origin,
+			packageName,
+			version,
+		);
+		const relatedLinks = extractRelatedLinks(
+			enhanced,
+			url.toString(),
+			url.origin,
+		);
+		const bodyParts = [
 			instructionHeader,
-			"",
-			markdown,
-			"",
+			sourceSection,
+			enhanced,
+			agentData,
+			relatedPagesSection,
 			renderRelatedLinks(relatedLinks),
-		].join("\n");
+		].filter(Boolean);
+		const body = bodyParts.join("\n\n");
 		return markdownResponse(body, ttlSeconds);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "Unknown error";
