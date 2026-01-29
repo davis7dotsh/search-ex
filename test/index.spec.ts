@@ -1,24 +1,86 @@
-import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
-import worker from '../src/index';
+import { describe, expect, it } from "vitest";
+import { handleRequest } from "../src/index";
 
-// For now, you'll need to do something like this to get a correctly-typed
-// `Request` to pass to `worker.fetch()`.
-const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
+const makeFetchStub =
+	(routes: Record<string, Response>) => async (input: RequestInfo | URL) => {
+		const url =
+			typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+		return routes[url] ?? new Response("Not Found", { status: 404 });
+	};
 
-describe('Hello World worker', () => {
-	it('responds with Hello World! (unit style)', async () => {
-		const request = new IncomingRequest('http://example.com');
-		// Create an empty context to pass to `worker.fetch()`.
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		// Wait for all `Promise`s passed to `ctx.waitUntil()` to settle before running test assertions
-		await waitOnExecutionContext(ctx);
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+describe("hexdocs wrapper worker", () => {
+	it("builds an enriched llms.txt response with links", async () => {
+		const llmsText = [
+			"# ai_sdk_ex",
+			"",
+			"## Modules",
+			"- AI.Messages - Handles chat",
+			"",
+			"## Exceptions",
+			"- AI.Error",
+		].join("\n");
+		const fetcher = makeFetchStub({
+			"https://hexdocs.pm/ai_sdk_ex/0.1.1/llms.txt": new Response(llmsText, {
+				headers: { "content-type": "text/markdown" },
+			}),
+		});
+
+		const request = new Request(
+			"https://wrapper.example/ai_sdk_ex/0.1.1/llms.txt",
+		);
+		const response = await handleRequest(request, fetcher);
+		const body = await response.text();
+
+		expect(body).toContain("Navigation + Discovery Instructions");
+		expect(body).toContain(
+			"https://wrapper.example/ai_sdk_ex/0.1.1/AI.Messages.html",
+		);
+		expect(body).toContain(
+			"Markdown: https://wrapper.example/ai_sdk_ex/0.1.1/AI.Messages.md",
+		);
+		expect(body).toContain(
+			"https://wrapper.example/ai_sdk_ex/0.1.1/AI.Error.html",
+		);
 	});
 
-	it('responds with Hello World! (integration style)', async () => {
-		const response = await SELF.fetch('https://example.com');
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+	it("uses Copy Markdown link when available and appends related links", async () => {
+		const html = [
+			"<html>",
+			"<body>",
+			'<a href="AI.Messages.md">Copy Markdown</a>',
+			"</body>",
+			"</html>",
+		].join("");
+		const markdown = "# AI.Messages\n\nSee [AI.Error](AI.Error.html)";
+		const fetcher = makeFetchStub({
+			"https://hexdocs.pm/ai_sdk_ex/0.1.1/AI.Messages.html": new Response(
+				html,
+				{
+					headers: { "content-type": "text/html" },
+				},
+			),
+			"https://hexdocs.pm/ai_sdk_ex/0.1.1/AI.Messages.md": new Response(
+				markdown,
+				{
+					headers: { "content-type": "text/markdown" },
+				},
+			),
+		});
+
+		const request = new Request(
+			"https://wrapper.example/ai_sdk_ex/0.1.1/AI.Messages.html",
+		);
+		const response = await handleRequest(request, fetcher);
+		const body = await response.text();
+
+		expect(body).toContain("# AI.Messages");
+		expect(body).toContain("## Related Links");
+		expect(body).toContain(
+			"https://wrapper.example/ai_sdk_ex/0.1.1/AI.Error.html",
+		);
 	});
 });
