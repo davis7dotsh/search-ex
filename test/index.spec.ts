@@ -13,20 +13,51 @@ const makeFetchStub =
 	};
 
 describe("hexdocs wrapper worker", () => {
-	it("builds an enriched llms.txt response with links", async () => {
-		const llmsText = [
-			"# ai_sdk_ex",
-			"",
-			"## Modules",
-			"- AI.Messages - Handles chat",
-			"",
-			"## Exceptions",
-			"- AI.Error",
-		].join("\n");
-		const fetcher = makeFetchStub({
-			"https://hexdocs.pm/ai_sdk_ex/0.1.1/llms.txt": new Response(llmsText, {
-				headers: { "content-type": "text/markdown" },
+	it("builds an llms.txt index from api-reference and sidebar data", async () => {
+		const apiReferenceHtml = [
+			"<html>",
+			"<head>",
+			'<script defer src="dist/sidebar_items-TEST.js"></script>',
+			"</head>",
+			"<body>",
+			'<h2 id="modules">Modules</h2>',
+			'<div class="summary">',
+			'<div class="summary-row">',
+			'<div class="summary-signature"><a href="AI.Messages.html">AI.Messages</a></div>',
+			'<div class="summary-synopsis"><p>Handles chat</p></div>',
+			"</div>",
+			"</div>",
+			"</body>",
+			"</html>",
+		].join("");
+		const sidebarItems = [
+			"sidebarNodes=",
+			JSON.stringify({
+				modules: [{ id: "AI.Messages", deprecated: false, group: "" }],
+				extras: [{ id: "readme", group: "", title: "README" }],
+				tasks: [
+					{
+						id: "Mix.Tasks.Ecto.Migrate",
+						deprecated: false,
+						group: "",
+						title: "mix ecto.migrate",
+						sections: [],
+					},
+				],
 			}),
+			";",
+		].join("");
+		const fetcher = makeFetchStub({
+			"https://hexdocs.pm/ai_sdk_ex/0.1.1/api-reference.html": new Response(
+				apiReferenceHtml,
+				{
+					headers: { "content-type": "text/html" },
+				},
+			),
+			"https://hexdocs.pm/ai_sdk_ex/0.1.1/dist/sidebar_items-TEST.js":
+				new Response(sidebarItems, {
+					headers: { "content-type": "text/javascript" },
+				}),
 		});
 
 		const request = new Request(
@@ -35,16 +66,15 @@ describe("hexdocs wrapper worker", () => {
 		const response = await handleRequest(request, fetcher);
 		const body = await response.text();
 
-		expect(body).toContain("Navigation + Discovery Instructions");
+		expect(body).toContain("## Package");
 		expect(body).toContain(
 			"https://wrapper.example/ai_sdk_ex/0.1.1/AI.Messages.html",
 		);
 		expect(body).toContain(
 			"Markdown: https://wrapper.example/ai_sdk_ex/0.1.1/AI.Messages.md",
 		);
-		expect(body).toContain(
-			"https://wrapper.example/ai_sdk_ex/0.1.1/AI.Error.html",
-		);
+		expect(body).toContain("## Guides");
+		expect(body).toContain("## Mix Tasks");
 	});
 
 	it("uses Copy Markdown link when available and appends related links", async () => {
@@ -82,5 +112,55 @@ describe("hexdocs wrapper worker", () => {
 		expect(body).toContain(
 			"https://wrapper.example/ai_sdk_ex/0.1.1/AI.Error.html",
 		);
+	});
+
+	it("serves a package index.json payload", async () => {
+		const apiReferenceHtml = [
+			"<html>",
+			"<head>",
+			'<script defer src="dist/sidebar_items-TEST.js"></script>',
+			"</head>",
+			"<body>",
+			'<h2 id="modules">Modules</h2>',
+			'<div class="summary">',
+			'<div class="summary-row">',
+			'<div class="summary-signature"><a href="AI.Messages.html">AI.Messages</a></div>',
+			'<div class="summary-synopsis"><p>Handles chat</p></div>',
+			"</div>",
+			"</div>",
+			"</body>",
+			"</html>",
+		].join("");
+		const sidebarItems = [
+			"sidebarNodes=",
+			JSON.stringify({
+				modules: [{ id: "AI.Messages", deprecated: false, group: "" }],
+				extras: [{ id: "readme", group: "", title: "README" }],
+				tasks: [],
+			}),
+			";",
+		].join("");
+		const fetcher = makeFetchStub({
+			"https://hexdocs.pm/ai_sdk_ex/0.1.1/api-reference.html": new Response(
+				apiReferenceHtml,
+				{
+					headers: { "content-type": "text/html" },
+				},
+			),
+			"https://hexdocs.pm/ai_sdk_ex/0.1.1/dist/sidebar_items-TEST.js":
+				new Response(sidebarItems, {
+					headers: { "content-type": "text/javascript" },
+				}),
+		});
+
+		const request = new Request(
+			"https://wrapper.example/ai_sdk_ex/0.1.1/index.json",
+		);
+		const response = await handleRequest(request, fetcher);
+		const body = await response.json();
+
+		expect(body.package).toBe("ai_sdk_ex");
+		expect(body.modules[0].name).toBe("AI.Messages");
+		expect(body.guides[0].id).toBe("readme");
 	});
 });

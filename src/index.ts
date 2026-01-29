@@ -8,12 +8,83 @@ type OptionEntry = {
 	type: string;
 };
 
+type ModuleEntry = {
+	name: string;
+	summary?: string;
+	url: string;
+	markdown_url: string;
+	deprecated?: boolean;
+	group?: string;
+};
+
+type GuideEntry = {
+	id: string;
+	title: string;
+	group?: string;
+	url: string;
+	headers?: { id: string; anchor: string }[];
+};
+
+type TaskEntry = {
+	id: string;
+	title: string;
+	url: string;
+	deprecated?: boolean;
+	group?: string;
+	sections?: { id: string; anchor: string }[];
+};
+
+type TaskMapEntry = {
+	id: string;
+	title: string;
+	description: string;
+	entrypoints: { label: string; url: string }[];
+};
+
+type PackageIndex = {
+	package: string;
+	version?: string;
+	is_versioned: boolean;
+	base_path: string;
+	origin: string;
+	last_modified?: string;
+	source: {
+		api_reference: string;
+		sidebar_items?: string;
+	};
+	modules: ModuleEntry[];
+	guides: GuideEntry[];
+	tasks: TaskEntry[];
+	task_map: TaskMapEntry[];
+	generated_at: string;
+};
+
 const parsePathContext = (pathname: string) => {
-	const [packageName, version, ...rest] = pathname.split("/").filter(Boolean);
+	const [packageName, maybeVersion, ...rest] = pathname
+		.split("/")
+		.filter(Boolean);
+	if (!packageName || !maybeVersion) {
+		return {
+			packageName,
+			version: undefined,
+			restPath: "",
+			basePath: packageName ? `/${packageName}` : "",
+			isVersioned: false,
+		};
+	}
+	const isVersioned = isVersionSegment(maybeVersion);
+	const basePath = isVersioned
+		? `/${packageName}/${maybeVersion}`
+		: `/${packageName}`;
+	const restPath = isVersioned
+		? rest.join("/")
+		: [maybeVersion, ...rest].join("/");
 	return {
 		packageName,
-		version,
-		restPath: rest.join("/"),
+		version: isVersioned ? maybeVersion : undefined,
+		restPath,
+		basePath,
+		isVersioned,
 	};
 };
 
@@ -32,38 +103,29 @@ const markdownResponse = (body: string, ttlSeconds: number, status = 200) =>
 		},
 	});
 
-const buildInstructionHeader = (
-	origin: string,
-	packageName: string,
-	version: string,
-) => {
-	const base = `${origin}/${packageName}/${version}`;
+const jsonResponse = (body: unknown, ttlSeconds: number, status = 200) =>
+	new Response(JSON.stringify(body, null, 2), {
+		status,
+		headers: {
+			"content-type": "application/json; charset=utf-8",
+			"cache-control": `public, max-age=${ttlSeconds}${ttlSeconds === YEAR_TTL_SECONDS ? ", immutable" : ""}`,
+		},
+	});
+
+const errorWithDetails = (
+	message: string,
+	details: Record<string, string | number | null>,
+) => Object.assign(new Error(message), { details });
+
+const buildInstructionHeader = (origin: string, basePath: string) => {
+	const base = `${origin}${basePath}`;
 	return [
-		"## Navigation + Discovery Instructions",
-		"Use the URL patterns below as a shortcut for navigation. Explore as needed; these are hints, not constraints.",
-		"",
-		"```agent-navigation",
-		`WRAPPER_BASE=${origin}`,
-		`PACKAGE=${packageName}`,
-		`VERSION=${version}`,
-		`MODULE_HTML=${base}/{Module}.html`,
-		`MODULE_MD=${base}/{Module}.md`,
-		`MODULE_FUNCTIONS=${base}/{Module}.html#summary`,
-		`MODULE_TYPES=${base}/{Module}.html#types`,
-		`MODULE_CALLBACKS=${base}/{Module}.html#callbacks`,
-		`EXCEPTIONS_SOURCE=${base}/llms.txt`,
-		`README_HTML=${base}/readme.html`,
-		`README_MD=${base}/readme.md`,
-		'RELATED_LINKS=See the "Related Links" section at the end of every response.',
-		"```",
-		"",
-		"Steps (optional):",
-		`1. START with the current page and follow what looks relevant.`,
-		`2. USE the "Related Pages" section to hop to nearby modules when helpful.`,
-		`3. OPEN ${base}/llms.txt when you want a full module/exception index.`,
-		`4. For function lists, GO TO ${base}/{Module}.html#summary.`,
-		`5. For full details, GO TO ${base}/{Module}.md and scan "Types", "Callbacks", and "Exceptions".`,
-		`6. FOLLOW any URLs in the "Related Links" section to continue discovery.`,
+		"## Navigation",
+		`Base: ${base}`,
+		`Index: ${base}/index.json`,
+		`LLMs: ${base}/llms.txt`,
+		`Modules: ${base}/{Module}.html or ${base}/{Module}.md`,
+		`Guides: ${base}/{guide}.html`,
 	].join("\n");
 };
 
@@ -135,6 +197,19 @@ const rewriteMarkdownLinks = (
 		return normalized ? `[${label}](${normalized})` : match;
 	});
 
+const buildWrapperUrl = (
+	href: string,
+	baseUrl: string,
+	wrapperOrigin: string,
+) => normalizeLinkTarget(href, baseUrl, wrapperOrigin) ?? href;
+
+const toMarkdownUrl = (url: string) =>
+	url.endsWith(".md")
+		? url
+		: url.includes(".html")
+			? url.replace(/\.html(\b|$)/, ".md")
+			: `${url}.md`;
+
 const htmlToMarkdown = (html: string) => {
 	let output = html;
 	output = output.replace(/<script[\s\S]*?<\/script>/gi, "");
@@ -178,47 +253,38 @@ const htmlToMarkdown = (html: string) => {
 	return output.replace(/\n{3,}/g, "\n\n").trim();
 };
 
-const extractHtmlCodeBlocks = (html: string) => {
-	const blocks: { language?: string; code: string }[] = [];
-	for (const match of html.matchAll(
-		/<pre[^>]*><code([^>]*)>([\s\S]*?)<\/code><\/pre>/gi,
-	)) {
-		const attrs = match[1] ?? "";
-		const rawCode = match[2] ?? "";
-		const classMatch = attrs.match(/class=["']([^"']+)["']/i);
-		const classes = classMatch?.[1]?.split(/\s+/) ?? [];
-		const language =
-			classes
-				.find((value) => value.startsWith("language-"))
-				?.replace("language-", "") ??
-			classes.find((value) => value && value !== "highlight");
-		blocks.push({
-			language,
-			code: stripTags(rawCode).trim(),
-		});
-	}
-	const unique = new Map<string, { language?: string; code: string }>();
-	for (const block of blocks) {
-		if (block.code) {
-			unique.set(`${block.language ?? "text"}:${block.code}`, block);
-		}
-	}
-	return Array.from(unique.values());
+const findSidebarItemsUrl = (html: string, baseUrl: URL) => {
+	const match = html.match(/sidebar_items-[A-Za-z0-9]+\.js/);
+	return match ? new URL(`dist/${match[0]}`, baseUrl).toString() : null;
 };
 
-const appendCodeBlocks = (
-	markdown: string,
-	blocks: { language?: string; code: string }[],
-) => {
-	if (!blocks.length) {
-		return markdown;
+const parseSidebarNodes = (script: string) => {
+	const prefix = "sidebarNodes=";
+	const trimmed = script.trim();
+	if (!trimmed.startsWith(prefix)) {
+		return null;
 	}
-	const lines = ["## Code Blocks"];
-	for (const block of blocks) {
-		const fence = `\`\`\`${block.language ?? ""}`.trimEnd();
-		lines.push([fence, block.code, "```"].join("\n"));
+	try {
+		const jsonText = trimmed.slice(prefix.length).replace(/;$/, "");
+		return JSON.parse(jsonText) as {
+			modules?: { id: string; deprecated?: boolean; group?: string }[];
+			extras?: {
+				id: string;
+				group?: string;
+				title: string;
+				headers?: { id: string; anchor: string }[];
+			}[];
+			tasks?: {
+				id: string;
+				deprecated?: boolean;
+				group?: string;
+				title: string;
+				sections?: { id: string; anchor: string }[];
+			}[];
+		};
+	} catch {
+		return null;
 	}
-	return [markdown, "", lines.join("\n\n")].join("\n");
 };
 
 const resolveRelatedLink = (
@@ -247,16 +313,29 @@ const extractRelatedLinks = (
 ) => {
 	const links = new Set<string>();
 	const pattern = /\[([^\]]+)\]\(([^)]+)\)/g;
+	const pageUrl = new URL(baseUrl);
 	for (const match of markdown.matchAll(pattern)) {
 		const href = match[2]?.trim();
 		const resolved = href
 			? resolveRelatedLink(href, baseUrl, wrapperOrigin)
 			: null;
-		if (resolved) {
+		if (!resolved) {
+			continue;
+		}
+		try {
+			const resolvedUrl = new URL(resolved, pageUrl);
+			if (
+				resolvedUrl.origin === pageUrl.origin &&
+				resolvedUrl.pathname === pageUrl.pathname
+			) {
+				continue;
+			}
+			links.add(resolvedUrl.toString());
+		} catch {
 			links.add(resolved);
 		}
 	}
-	return Array.from(links);
+	return Array.from(links).slice(0, 30);
 };
 
 const extractModuleName = (markdown: string) => {
@@ -267,17 +346,23 @@ const extractModuleName = (markdown: string) => {
 const extractModuleReferences = (
 	markdown: string,
 	typeOptions: Map<string, OptionEntry[]>,
+	knownModules: Set<string>,
 ) => {
-	const modulePattern =
-		/\b(AI(?:\.[A-Za-z0-9_]+)+|AiSdkEx(?:\.[A-Za-z0-9_]+)+)\b/g;
+	const modulePattern = /\b[A-Z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+\b/g;
 	const modules = new Set<string>();
 	for (const match of markdown.matchAll(modulePattern)) {
-		modules.add(match[1]);
+		const name = match[0];
+		if (!knownModules.size || knownModules.has(name)) {
+			modules.add(name);
+		}
 	}
 	for (const options of typeOptions.values()) {
 		for (const option of options) {
 			for (const match of option.type.matchAll(modulePattern)) {
-				modules.add(match[1]);
+				const name = match[0];
+				if (!knownModules.size || knownModules.has(name)) {
+					modules.add(name);
+				}
 			}
 		}
 	}
@@ -287,15 +372,14 @@ const extractModuleReferences = (
 const renderRelatedPages = (
 	pages: string[],
 	origin: string,
-	packageName: string,
-	version: string,
+	basePath: string,
 ) => {
 	if (!pages.length) {
 		return null;
 	}
 	const lines = ["## Related Pages"];
 	for (const page of pages) {
-		lines.push(`- ${origin}/${packageName}/${version}/${page}.html`);
+		lines.push(`- ${origin}${basePath}/${page}.html`);
 	}
 	return lines.join("\n");
 };
@@ -333,6 +417,172 @@ const findMarkdownUrlFromHtml = (html: string, htmlUrl: URL) => {
 	return preferred ? new URL(preferred, htmlUrl).toString() : null;
 };
 
+const sliceSectionByHeading = (html: string, headingId: string) => {
+	const headingMatch = html.match(
+		new RegExp(`<h2[^>]*id=["']${headingId}["'][^>]*>`, "i"),
+	);
+	if (!headingMatch?.index) {
+		return "";
+	}
+	const start = headingMatch.index;
+	const rest = html.slice(start + headingMatch[0].length);
+	const nextMatch = rest.match(/<h2[^>]*id=["'][^"']+["'][^>]*>/i);
+	const end =
+		typeof nextMatch?.index === "number"
+			? start + headingMatch[0].length + nextMatch.index
+			: html.length;
+	return html.slice(start, end);
+};
+
+const parseApiReferenceModules = (html: string) => {
+	const section = sliceSectionByHeading(html, "modules");
+	if (!section) {
+		return [];
+	}
+	const rowPattern =
+		/<div class="summary-row">[\s\S]*?<a href="([^"]+)"[^>]*>([^<]+)<\/a>[\s\S]*?(?:<div class="summary-synopsis">[\s\S]*?<p>([\s\S]*?)<\/p>[\s\S]*?<\/div>)?/gi;
+	const modules: { name: string; href: string; summary?: string }[] = [];
+	for (const match of section.matchAll(rowPattern)) {
+		const href = match[1]?.trim();
+		const name = match[2]?.trim();
+		if (!href || !name) {
+			continue;
+		}
+		const summaryRaw = match[3]?.trim();
+		const summary = summaryRaw ? stripTags(summaryRaw).trim() : undefined;
+		modules.push({ name, href, summary });
+	}
+	return modules;
+};
+
+const buildTaskMap = ({
+	modules,
+	guides,
+	tasks,
+}: {
+	modules: ModuleEntry[];
+	guides: GuideEntry[];
+	tasks: TaskEntry[];
+}) => {
+	const moduleMap = new Map(modules.map((entry) => [entry.name, entry]));
+	const taskMap = new Map(tasks.map((entry) => [entry.title, entry]));
+	const guideMap = new Map(guides.map((entry) => [entry.id, entry]));
+	const entrypoints = ({
+		moduleNames = [],
+		taskTitles = [],
+		guideIds = [],
+	}: {
+		moduleNames?: string[];
+		taskTitles?: string[];
+		guideIds?: string[];
+	}) => {
+		const points: { label: string; url: string }[] = [];
+		for (const name of moduleNames) {
+			const module = moduleMap.get(name);
+			if (module) {
+				points.push({ label: module.name, url: module.url });
+			}
+		}
+		for (const title of taskTitles) {
+			const task = taskMap.get(title);
+			if (task) {
+				points.push({ label: task.title, url: task.url });
+			}
+		}
+		for (const id of guideIds) {
+			const guide = guideMap.get(id);
+			if (guide) {
+				points.push({ label: guide.title, url: guide.url });
+			}
+		}
+		const seen = new Set<string>();
+		return points.filter((point) => {
+			if (seen.has(point.url)) {
+				return false;
+			}
+			seen.add(point.url);
+			return true;
+		});
+	};
+	const tasksOut: TaskMapEntry[] = [];
+	const hasGuide = (id: string) => guideMap.has(id);
+	const hasModule = (name: string) => moduleMap.has(name);
+	const hasTask = (title: string) => taskMap.has(title);
+
+	if (hasGuide("getting-started") || hasGuide("readme")) {
+		tasksOut.push({
+			id: "getting-started",
+			title: "Get started",
+			description: "Install and configure the library.",
+			entrypoints: entrypoints({
+				guideIds: hasGuide("getting-started")
+					? ["getting-started"]
+					: ["readme"],
+			}),
+		});
+	}
+
+	if (
+		hasModule("Ecto.Migration") ||
+		hasModule("Ecto.Migrator") ||
+		hasTask("mix ecto.migrate")
+	) {
+		tasksOut.push({
+			id: "migrations",
+			title: "Run database migrations",
+			description: "Create and apply schema changes safely.",
+			entrypoints: entrypoints({
+				moduleNames: ["Ecto.Migration", "Ecto.Migrator"],
+				taskTitles: [
+					"mix ecto.gen.migration",
+					"mix ecto.migrate",
+					"mix ecto.rollback",
+				],
+				guideIds: ["safe-ecto-migrations"],
+			}),
+		});
+	}
+
+	if (hasModule("Ecto.Repo") || hasTask("mix ecto.create")) {
+		tasksOut.push({
+			id: "repo-setup",
+			title: "Configure and manage the repo",
+			description: "Connect to the database and manage lifecycle tasks.",
+			entrypoints: entrypoints({
+				moduleNames: ["Ecto.Repo"],
+				taskTitles: ["mix ecto.create", "mix ecto.drop", "mix ecto.reset"],
+				guideIds: ["getting-started"],
+			}),
+		});
+	}
+
+	if (hasModule("Ecto.Schema") || hasModule("Ecto.Changeset")) {
+		tasksOut.push({
+			id: "schemas",
+			title: "Define schemas and validate data",
+			description: "Map data structures and validate changes.",
+			entrypoints: entrypoints({
+				moduleNames: ["Ecto.Schema", "Ecto.Changeset"],
+				guideIds: ["getting-started"],
+			}),
+		});
+	}
+
+	if (hasModule("Ecto.Query")) {
+		tasksOut.push({
+			id: "queries",
+			title: "Query data",
+			description: "Build composable, secure queries.",
+			entrypoints: entrypoints({
+				moduleNames: ["Ecto.Query"],
+				guideIds: ["getting-started"],
+			}),
+		});
+	}
+
+	return tasksOut.filter((entry) => entry.entrypoints.length);
+};
+
 const fetchUpstream = (fetcher: typeof fetch, url: URL, ttlSeconds: number) =>
 	fetcher(url, {
 		cf: {
@@ -340,6 +590,118 @@ const fetchUpstream = (fetcher: typeof fetch, url: URL, ttlSeconds: number) =>
 			cacheEverything: true,
 		},
 	});
+
+const fetchUpstreamText = async (
+	fetcher: typeof fetch,
+	url: URL,
+	ttlSeconds: number,
+) => {
+	const response = await fetchUpstream(fetcher, url, ttlSeconds);
+	const text = await response.text();
+	return { response, text, url: url.toString() };
+};
+
+const buildPackageIndex = async (
+	requestUrl: URL,
+	fetcher: typeof fetch,
+	ttlSeconds: number,
+) => {
+	const { packageName, version, basePath, isVersioned } = parsePathContext(
+		requestUrl.pathname,
+	);
+	const apiReferenceUrl = new URL(
+		isVersioned
+			? `/${packageName}/${version}/api-reference.html`
+			: `/${packageName}/api-reference.html`,
+		UPSTREAM_ORIGIN,
+	);
+	const apiResponse = await fetchUpstream(fetcher, apiReferenceUrl, ttlSeconds);
+	if (!apiResponse.ok) {
+		throw errorWithDetails("Upstream api-reference fetch failed", {
+			attempted: apiReferenceUrl.toString(),
+			status: apiResponse.status,
+		});
+	}
+	const apiHtml = await apiResponse.text();
+	const sidebarUrl = findSidebarItemsUrl(apiHtml, apiReferenceUrl);
+	let resolvedSidebarNodes: ReturnType<typeof parseSidebarNodes> = null;
+	if (sidebarUrl) {
+		const resolved = new URL(sidebarUrl);
+		const { response, text } = await fetchUpstreamText(
+			fetcher,
+			resolved,
+			ttlSeconds,
+		);
+		resolvedSidebarNodes = response.ok ? parseSidebarNodes(text) : null;
+	}
+	const sidebarModuleMap = new Map(
+		(resolvedSidebarNodes?.modules ?? []).map((entry) => [entry.id, entry]),
+	);
+	const modulesFromApi = parseApiReferenceModules(apiHtml);
+	const modules: ModuleEntry[] =
+		modulesFromApi.length > 0
+			? modulesFromApi.map((entry) => {
+					const url = buildWrapperUrl(
+						entry.href,
+						apiReferenceUrl.toString(),
+						requestUrl.origin,
+					);
+					return {
+						name: entry.name,
+						summary: entry.summary,
+						url,
+						markdown_url: toMarkdownUrl(url),
+						deprecated: sidebarModuleMap.get(entry.name)?.deprecated ?? false,
+						group: sidebarModuleMap.get(entry.name)?.group,
+					};
+				})
+			: (resolvedSidebarNodes?.modules ?? []).map((entry) => {
+					const url = `${requestUrl.origin}${basePath}/${entry.id}.html`;
+					return {
+						name: entry.id,
+						url,
+						markdown_url: toMarkdownUrl(url),
+						deprecated: entry.deprecated ?? false,
+						group: entry.group,
+					};
+				});
+	const guides: GuideEntry[] = (resolvedSidebarNodes?.extras ?? []).map(
+		(entry) => ({
+			id: entry.id,
+			title: entry.title,
+			group: entry.group,
+			headers: entry.headers,
+			url: `${requestUrl.origin}${basePath}/${entry.id}.html`,
+		}),
+	);
+	const tasks: TaskEntry[] = (resolvedSidebarNodes?.tasks ?? []).map(
+		(entry) => ({
+			id: entry.id,
+			title: entry.title,
+			group: entry.group,
+			deprecated: entry.deprecated ?? false,
+			sections: entry.sections,
+			url: `${requestUrl.origin}${basePath}/${entry.id}.html`,
+		}),
+	);
+	return {
+		package: packageName,
+		version,
+		is_versioned: isVersioned,
+		base_path: basePath,
+		origin: requestUrl.origin,
+		last_modified: apiResponse.headers.get("last-modified") ?? undefined,
+		source: {
+			api_reference: apiReferenceUrl.toString(),
+			sidebar_items: sidebarUrl ?? undefined,
+		},
+		modules,
+		guides,
+		tasks,
+		task_map: buildTaskMap({ modules, guides, tasks }),
+		generated_at: new Date().toISOString(),
+	} satisfies PackageIndex;
+};
 
 const getMarkdownFromPath = async (
 	requestUrl: URL,
@@ -356,20 +718,26 @@ const getMarkdownFromPath = async (
 			UPSTREAM_ORIGIN,
 		);
 		const response = await fetchUpstream(fetcher, upstreamUrl, ttlSeconds);
-		if (!response.ok) {
-			throw new Error(`Upstream markdown fetch failed (${response.status})`);
+		if (response.ok) {
+			return response.text();
 		}
-		const markdown = await response.text();
 		const htmlResponse = await fetchUpstream(fetcher, htmlUrl, ttlSeconds);
-		if (!htmlResponse.ok) {
-			return markdown;
+		if (htmlResponse.ok) {
+			return htmlToMarkdown(await htmlResponse.text());
 		}
-		const html = await htmlResponse.text();
-		return appendCodeBlocks(markdown, extractHtmlCodeBlocks(html));
+		throw errorWithDetails("Upstream markdown fetch failed", {
+			attempted: upstreamUrl.toString(),
+			status: response.status,
+			fallback: htmlUrl.toString(),
+			fallback_status: htmlResponse.status,
+		});
 	}
 	const htmlResponse = await fetchUpstream(fetcher, upstreamUrl, ttlSeconds);
 	if (!htmlResponse.ok) {
-		throw new Error(`Upstream html fetch failed (${htmlResponse.status})`);
+		throw errorWithDetails("Upstream html fetch failed", {
+			attempted: upstreamUrl.toString(),
+			status: htmlResponse.status,
+		});
 	}
 	const html = await htmlResponse.text();
 	const markdownUrl = findMarkdownUrlFromHtml(html, upstreamUrl);
@@ -380,93 +748,10 @@ const getMarkdownFromPath = async (
 			ttlSeconds,
 		);
 		if (markdownResponse.ok) {
-			const markdown = await markdownResponse.text();
-			return appendCodeBlocks(markdown, extractHtmlCodeBlocks(html));
+			return markdownResponse.text();
 		}
 	}
-	return appendCodeBlocks(htmlToMarkdown(html), extractHtmlCodeBlocks(html));
-};
-
-const parseLlmsEntry = (line: string) => {
-	const content = line.replace(/^-+\s*/, "").trim();
-	const linkMatch = content.match(
-		/^\[([^\]]+)\]\(([^)]+)\)\s*(?:[:\-–—]\s*)?(.*)$/,
-	);
-	if (linkMatch) {
-		return {
-			name: linkMatch[1].trim(),
-			summary: linkMatch[3]?.trim(),
-		};
-	}
-	const separatorMatch = content.match(/^(.*?)(?:\s+[-–—]\s+)(.+)$/);
-	if (separatorMatch) {
-		return {
-			name: separatorMatch[1]?.trim(),
-			summary: separatorMatch[2]?.trim(),
-		};
-	}
-	if (!content) {
-		return null;
-	}
-	if (content.includes("[") && content.includes("](")) {
-		return null;
-	}
-	return { name: content, summary: "" };
-};
-
-const normalizeEntryName = (name: string) =>
-	name
-		.replace(/`/g, "")
-		.replace(/\.md$/i, "")
-		.replace(/\.html$/i, "")
-		.trim();
-
-const transformLlmsText = (
-	text: string,
-	origin: string,
-	packageName: string,
-	version: string,
-) => {
-	const base = `${origin}/${packageName}/${version}`;
-	const lines = text.split("\n");
-	let section: "modules" | "exceptions" | null = null;
-	const output: string[] = [];
-	for (const line of lines) {
-		const headingMatch = line.match(/^#{1,6}\s+(.*)$/);
-		if (headingMatch) {
-			const heading = headingMatch[1]?.toLowerCase() ?? "";
-			if (heading.includes("module")) {
-				section = "modules";
-			} else if (heading.includes("exception")) {
-				section = "exceptions";
-			} else {
-				section = null;
-			}
-			output.push(line);
-			continue;
-		}
-		const trimmed = line.trim();
-		if (/^-\s+exceptions\b/i.test(trimmed)) {
-			section = "exceptions";
-			output.push("## Exceptions");
-			continue;
-		}
-		if (line.trim().startsWith("-") && section) {
-			const entry = parseLlmsEntry(line);
-			if (!entry?.name) {
-				output.push(line);
-				continue;
-			}
-			const name = normalizeEntryName(entry.name);
-			const htmlUrl = `${base}/${encodeURIComponent(name)}.html`;
-			const mdUrl = `${base}/${encodeURIComponent(name)}.md`;
-			const summary = entry.summary ? ` — ${entry.summary}` : "";
-			output.push(`- [${name}](${htmlUrl})${summary} (Markdown: ${mdUrl})`);
-			continue;
-		}
-		output.push(line);
-	}
-	return output.join("\n").trim();
+	return htmlToMarkdown(html);
 };
 
 const parseOptionLine = (line: string) => {
@@ -597,6 +882,181 @@ const parseCallbacks = (markdown: string) => {
 		}
 	}
 	return callbacks;
+};
+
+const extractFirstParagraph = (markdown: string) => {
+	const lines = markdown.split("\n");
+	let inCode = false;
+	let seenTitle = false;
+	const paragraph: string[] = [];
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith("```")) {
+			inCode = !inCode;
+			continue;
+		}
+		if (!seenTitle) {
+			if (trimmed.startsWith("# ")) {
+				seenTitle = true;
+			}
+			continue;
+		}
+		if (inCode) {
+			continue;
+		}
+		if (!trimmed) {
+			if (paragraph.length) {
+				break;
+			}
+			continue;
+		}
+		if (trimmed.startsWith("#")) {
+			break;
+		}
+		if (trimmed.startsWith("[🔗](")) {
+			continue;
+		}
+		paragraph.push(trimmed);
+	}
+	return paragraph.length ? paragraph.join(" ") : null;
+};
+
+const extractWarnings = (markdown: string) => {
+	const lines = markdown.split("\n");
+	const warnings: string[] = [];
+	let inCode = false;
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith("```")) {
+			inCode = !inCode;
+			continue;
+		}
+		if (inCode || !trimmed) {
+			continue;
+		}
+		const match = trimmed.match(
+			/^(?:NOTE|Note|WARNING|Warning|CAUTION|Caution):\s*(.+)$/,
+		);
+		if (match?.[1]) {
+			warnings.push(match[1].trim());
+			if (warnings.length >= 3) {
+				break;
+			}
+		}
+	}
+	return warnings;
+};
+
+const buildOperationalWorkflow = (markdown: string) => {
+	const steps: string[] = [];
+	if (markdown.includes("mix ecto.gen.migration")) {
+		steps.push("- Generate a migration: `mix ecto.gen.migration <name>`.");
+	}
+	if (markdown.includes("priv/") && markdown.includes("migrations")) {
+		steps.push("- Edit the migration file under `priv/.../migrations`.");
+	}
+	if (markdown.includes("mix ecto.migrate")) {
+		steps.push("- Apply migrations: `mix ecto.migrate`.");
+	}
+	if (markdown.includes("mix ecto.rollback")) {
+		steps.push("- Roll back when needed: `mix ecto.rollback --step 1`.");
+	}
+	if (
+		markdown.includes("Ecto.Migrator") ||
+		markdown.includes("bin/my_app eval")
+	) {
+		steps.push(
+			"- For releases, run migrations via `Ecto.Migrator` in a release module.",
+		);
+	}
+	return steps.length ? ["## Operational Workflow", ...steps].join("\n") : null;
+};
+
+const buildModuleSynopsis = ({
+	moduleName,
+	markdown,
+	specs,
+	taskMap,
+	relatedPages,
+	moduleSummary,
+	origin,
+	basePath,
+}: {
+	moduleName: string | null;
+	markdown: string;
+	specs: Map<string, { spec: string; optsType?: string }>;
+	taskMap: TaskMapEntry[];
+	relatedPages: string[];
+	moduleSummary?: string;
+	origin: string;
+	basePath: string;
+}) => {
+	if (!moduleName) {
+		return null;
+	}
+	const purpose = moduleSummary ?? extractFirstParagraph(markdown);
+	const entrypoints = Array.from(specs.keys()).slice(0, 5);
+	const taskMatches = taskMap
+		.filter((task) =>
+			task.entrypoints.some(
+				(entry) =>
+					entry.label === moduleName ||
+					entry.url.endsWith(`/${moduleName}.html`),
+			),
+		)
+		.map((task) => task.title)
+		.slice(0, 3);
+	const seeAlso = relatedPages.slice(0, 5).map((page) => ({
+		label: page,
+		url: `${origin}${basePath}/${page}.html`,
+	}));
+	const lines = ["## Module Synopsis"];
+	if (purpose) {
+		lines.push(`- Purpose: ${purpose}`);
+	}
+	if (entrypoints.length) {
+		lines.push(
+			`- Primary entrypoints: ${entrypoints.map((entry) => `\`${entry}\``).join(", ")}`,
+		);
+	}
+	if (taskMatches.length) {
+		lines.push(`- Common tasks: ${taskMatches.join(", ")}`);
+	}
+	if (seeAlso.length) {
+		lines.push(
+			`- See also: ${seeAlso
+				.map((entry) => `[${entry.label}](${entry.url})`)
+				.join(", ")}`,
+		);
+	}
+	return lines.length > 1 ? lines.join("\n") : null;
+};
+
+const renderGuidesSection = (guides: GuideEntry[]) => {
+	if (!guides.length) {
+		return null;
+	}
+	const lines = ["## Guides"];
+	for (const guide of guides.slice(0, 30)) {
+		const group = guide.group ? ` (${guide.group})` : "";
+		lines.push(`- [${guide.title}](${guide.url})${group}`);
+	}
+	return lines.join("\n");
+};
+
+const renderTaskMapSection = (taskMap: TaskMapEntry[]) => {
+	if (!taskMap.length) {
+		return null;
+	}
+	const lines = ["## Task Map"];
+	for (const task of taskMap) {
+		const entrypoints = task.entrypoints
+			.map((entry) => `[${entry.label}](${entry.url})`)
+			.join(", ");
+		const suffix = entrypoints ? ` (Entrypoints: ${entrypoints})` : "";
+		lines.push(`- ${task.title} — ${task.description}${suffix}`);
+	}
+	return lines.join("\n");
 };
 
 const insertSectionHeadings = (
@@ -754,22 +1214,43 @@ const buildLlmsReplacement = async (
 	fetcher: typeof fetch,
 	ttlSeconds: number,
 ) => {
-	const { packageName, version } = parsePathContext(requestUrl.pathname);
-	const upstreamUrl = new URL(
-		`${requestUrl.pathname}${requestUrl.search}`,
-		UPSTREAM_ORIGIN,
+	const index = await buildPackageIndex(requestUrl, fetcher, ttlSeconds);
+	const moduleLines = index.modules.map((entry) => {
+		const summary = entry.summary ? ` — ${entry.summary}` : "";
+		return `- [${entry.name}](${entry.url})${summary} (Markdown: ${entry.markdown_url})`;
+	});
+	const guideLines = index.guides.map((entry) => {
+		const group = entry.group ? ` (${entry.group})` : "";
+		return `- [${entry.title}](${entry.url})${group}`;
+	});
+	const taskLines = index.tasks.map(
+		(entry) => `- [${entry.title}](${entry.url})`,
 	);
-	const response = await fetchUpstream(fetcher, upstreamUrl, ttlSeconds);
-	if (!response.ok) {
-		throw new Error(`Upstream llms.txt fetch failed (${response.status})`);
-	}
-	const upstreamText = await response.text();
-	return transformLlmsText(
-		upstreamText,
-		requestUrl.origin,
-		packageName,
-		version,
-	);
+	const lines = [
+		"## Package",
+		`- name: ${index.package}`,
+		index.version ? `- version: ${index.version}` : "- version: latest",
+		`- index: ${index.origin}${index.base_path}/index.json`,
+		`- api_reference: ${index.source.api_reference}`,
+		index.source.sidebar_items
+			? `- sidebar_items: ${index.source.sidebar_items}`
+			: null,
+		index.last_modified ? `- last_modified: ${index.last_modified}` : null,
+		"",
+		renderTaskMapSection(index.task_map),
+		"",
+		"## Modules",
+		...moduleLines,
+		"",
+		index.guides.length ? "## Guides" : null,
+		...guideLines,
+		"",
+		index.tasks.length ? "## Mix Tasks" : null,
+		...taskLines,
+	]
+		.filter((line): line is string => Boolean(line && line.length))
+		.join("\n");
+	return lines.trim();
 };
 
 export const handleRequest = async (
@@ -777,8 +1258,10 @@ export const handleRequest = async (
 	fetcher: typeof fetch = fetch,
 ) => {
 	const url = new URL(request.url);
-	const { packageName, version } = parsePathContext(url.pathname);
-	if (!packageName || !version) {
+	const { packageName, version, restPath, basePath } = parsePathContext(
+		url.pathname,
+	);
+	if (!packageName || !restPath) {
 		return markdownResponse(
 			[
 				"## Invalid Request",
@@ -790,14 +1273,15 @@ export const handleRequest = async (
 		);
 	}
 	const ttlSeconds = cacheTtlFor(version);
-	const instructionHeader = buildInstructionHeader(
-		url.origin,
-		packageName,
-		version,
-	);
+	const instructionHeader = buildInstructionHeader(url.origin, basePath);
 	const sourceSection = buildSourceSection(url);
 	const isLlms = url.pathname.endsWith("/llms.txt");
+	const isIndexJson = url.pathname.endsWith("/index.json");
 	try {
+		if (isIndexJson) {
+			const index = await buildPackageIndex(url, fetcher, ttlSeconds);
+			return jsonResponse(index, ttlSeconds);
+		}
 		if (isLlms) {
 			const llmsBodyRaw = await buildLlmsReplacement(url, fetcher, ttlSeconds);
 			const llmsBody = rewriteMarkdownLinks(
@@ -805,16 +1289,7 @@ export const handleRequest = async (
 				url.toString(),
 				url.origin,
 			);
-			const relatedLinks = [
-				`${url.origin}/${packageName}/${version}/readme.html`,
-				`${url.origin}/${packageName}/${version}/readme.md`,
-			];
-			const bodyParts = [
-				instructionHeader,
-				sourceSection,
-				llmsBody,
-				renderRelatedLinks(relatedLinks),
-			].filter(Boolean);
+			const bodyParts = [instructionHeader, llmsBody].filter(Boolean);
 			const body = bodyParts.join("\n\n");
 			return markdownResponse(body, ttlSeconds);
 		}
@@ -824,6 +1299,11 @@ export const handleRequest = async (
 			url.toString(),
 			url.origin,
 		);
+		const packageIndex = await buildPackageIndex(
+			url,
+			fetcher,
+			ttlSeconds,
+		).catch(() => null);
 		const optionsByType = parseTypeOptions(rewritten);
 		const specs = parseSpecs(rewritten);
 		const callbacks = parseCallbacks(rewritten);
@@ -836,37 +1316,96 @@ export const handleRequest = async (
 		);
 		const agentData = buildAgentDataSection(optionsByType);
 		const moduleName = extractModuleName(rewritten);
-		const relatedPages = extractModuleReferences(enhanced, optionsByType)
+		const knownModules = new Set(
+			(packageIndex?.modules ?? []).map((entry) => entry.name),
+		);
+		const relatedPages = extractModuleReferences(
+			enhanced,
+			optionsByType,
+			knownModules,
+		)
 			.filter((page) => page !== moduleName)
 			.slice(0, 20);
+		const moduleSummary = packageIndex?.modules.find(
+			(entry) => entry.name === moduleName,
+		)?.summary;
+		const moduleSynopsis = buildModuleSynopsis({
+			moduleName,
+			markdown: enhanced,
+			specs,
+			taskMap: packageIndex?.task_map ?? [],
+			relatedPages,
+			moduleSummary,
+			origin: url.origin,
+			basePath,
+		});
+		const warnings = extractWarnings(enhanced);
+		const warningsSection = warnings.length
+			? ["## Warnings", ...warnings.map((warning) => `- ${warning}`)].join("\n")
+			: null;
+		const workflowSection = buildOperationalWorkflow(enhanced);
 		const relatedPagesSection = renderRelatedPages(
 			relatedPages,
 			url.origin,
-			packageName,
-			version,
+			basePath,
 		);
 		const relatedLinks = extractRelatedLinks(
 			enhanced,
 			url.toString(),
 			url.origin,
 		);
+		const guidesSection = packageIndex
+			? renderGuidesSection(packageIndex.guides)
+			: null;
 		const bodyParts = [
 			instructionHeader,
 			sourceSection,
+			moduleSynopsis,
+			warningsSection,
+			workflowSection,
 			enhanced,
 			agentData,
 			relatedPagesSection,
+			guidesSection,
 			renderRelatedLinks(relatedLinks),
 		].filter(Boolean);
 		const body = bodyParts.join("\n\n");
 		return markdownResponse(body, ttlSeconds);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "Unknown error";
-		return markdownResponse(
-			[instructionHeader, "", "## Upstream Error", message].join("\n"),
-			HOUR_TTL_SECONDS,
-			502,
-		);
+		const details =
+			error && typeof error === "object" && "details" in error
+				? (error as { details?: Record<string, string | number | null> })
+						.details
+				: null;
+		const attempted = details?.attempted ?? url.toString();
+		const status = details?.status ?? null;
+		const fallback = details?.fallback ?? null;
+		const fallbackStatus = details?.fallback_status ?? null;
+		if (isIndexJson) {
+			return jsonResponse(
+				{
+					error: message,
+					attempted,
+					status,
+					fallback,
+					fallback_status: fallbackStatus,
+				},
+				HOUR_TTL_SECONDS,
+				502,
+			);
+		}
+		const errorLines = [
+			instructionHeader,
+			"",
+			"## Upstream Error",
+			`message: ${message}`,
+			`attempted: ${attempted}`,
+			status ? `status: ${status}` : null,
+			fallback ? `fallback: ${fallback}` : "fallback: none",
+			fallback && fallbackStatus ? `fallback_status: ${fallbackStatus}` : null,
+		].filter((line): line is string => Boolean(line));
+		return markdownResponse(errorLines.join("\n"), HOUR_TTL_SECONDS, 502);
 	}
 };
 
