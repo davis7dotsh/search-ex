@@ -103,11 +103,11 @@ const buildHomePage = (origin: string) =>
 		"",
 		"## Agent Instructions (copy into AGENTS.md)",
 		"```",
-		"# Elixir Hex docs browsing (local)",
-		`- Always start at: ${origin}/ecto/Ecto.html`,
-		"- Read the Navigation block to find `llms.txt` and `index.json`.",
+		"# Elixir Hex docs browsing",
+		`- Use ${origin} to browse docs for any package in your mix.exs deps.`,
+		`- Example: if deps include {:phoenix, "~> 1.8"}, open ${origin}/phoenix/overview.html.`,
+		"- Start at a package llms.txt or a module/guide page, then follow the Navigation block to `llms.txt` and `index.json`.",
 		"- Use `llms.txt` to pick a task map entrypoint before searching.",
-		"- For migrations, follow the ecto task map to ecto_sql (Ecto.Migration / Ecto.Migrator / mix ecto.*).",
 		"- Prefer `.md` pages for cleaner parsing; fall back to `.html` if needed.",
 		"- Stay on origin URLs only (no external web browsing).",
 		"```",
@@ -254,12 +254,24 @@ const stripHexdocsChrome = (html: string) => {
 			regex: /<div[^>]*class=["'][^"']*top-search[^"']*["'][^>]*>/i,
 		},
 		{
+			tag: "a",
+			regex: /<a[^>]*class=["'][^"']*icon-action[^"']*["'][^>]*>/i,
+		},
+		{
 			tag: "div",
 			regex: /<div[^>]*class=["'][^"']*page-options[^"']*["'][^>]*>/i,
 		},
 		{
 			tag: "div",
 			regex: /<div[^>]*class=["'][^"']*page-actions[^"']*["'][^>]*>/i,
+		},
+		{
+			tag: "div",
+			regex: /<div[^>]*class=["'][^"']*bottom-actions[^"']*["'][^>]*>/i,
+		},
+		{
+			tag: "footer",
+			regex: /<footer[^>]*class=["'][^"']*footer[^"']*["'][^>]*>/i,
 		},
 	];
 	let output = html;
@@ -347,6 +359,30 @@ const preserveMarkdownCode = (markdown: string) => {
 		return restored;
 	};
 	return { output, restore };
+};
+
+const cleanMarkdownArtifacts = (markdown: string) => {
+	const preserved = preserveMarkdownCode(markdown);
+	const cleaned = preserved.output
+		.split("\n")
+		.filter((line) => {
+			const trimmed = line.trim();
+			if (!trimmed) {
+				return true;
+			}
+			if (trimmed === "[" || trimmed === "]") {
+				return false;
+			}
+			if (trimmed === "-" || trimmed === "*") {
+				return false;
+			}
+			if (/^View Source$/i.test(trimmed)) {
+				return false;
+			}
+			return true;
+		})
+		.join("\n");
+	return preserved.restore(cleaned).replace(/\n{3,}/g, "\n\n");
 };
 
 const htmlToMarkdown = (html: string) => {
@@ -1128,6 +1164,9 @@ const extractFirstParagraph = (markdown: string) => {
 		if (trimmed.startsWith("[🔗](")) {
 			continue;
 		}
+		if (/^Requirements?:/i.test(trimmed)) {
+			continue;
+		}
 		paragraph.push(trimmed);
 	}
 	return paragraph.length ? paragraph.join(" ") : null;
@@ -1266,6 +1305,21 @@ const buildModuleSynopsis = ({
 		);
 	}
 	return lines.length > 1 ? lines.join("\n") : null;
+};
+
+const buildGuideSynopsis = ({
+	title,
+	markdown,
+}: {
+	title: string;
+	markdown: string;
+}) => {
+	const purpose = extractFirstParagraph(markdown);
+	const lines = ["## Guide Synopsis", `- Title: ${title}`];
+	if (purpose) {
+		lines.push(`- Purpose: ${purpose}`);
+	}
+	return lines.join("\n");
 };
 
 const renderGuidesSection = (guides: GuideEntry[]) => {
@@ -1533,8 +1587,9 @@ export const handleRequest = async (
 			return markdownResponse(body, ttlSeconds);
 		}
 		const rawMarkdown = await getMarkdownFromPath(url, fetcher, ttlSeconds);
+		const cleanedMarkdown = cleanMarkdownArtifacts(rawMarkdown);
 		const rewritten = rewriteMarkdownLinks(
-			rawMarkdown,
+			cleanedMarkdown,
 			url.toString(),
 			url.origin,
 		);
@@ -1565,19 +1620,29 @@ export const handleRequest = async (
 		)
 			.filter((page) => page !== moduleName)
 			.slice(0, 20);
-		const moduleSummary = packageIndex?.modules.find(
+		const docId = restPath.replace(/\.html$/i, "").replace(/\.md$/i, "");
+		const guideEntry = packageIndex?.guides.find((entry) => entry.id === docId);
+		const moduleEntry = packageIndex?.modules.find(
 			(entry) => entry.name === moduleName,
-		)?.summary;
-		const moduleSynopsis = buildModuleSynopsis({
-			moduleName,
-			markdown: enhanced,
-			specs,
-			taskMap: packageIndex?.task_map ?? [],
-			relatedPages,
-			moduleSummary,
-			origin: url.origin,
-			basePath,
-		});
+		);
+		const moduleSynopsis = moduleEntry
+			? buildModuleSynopsis({
+					moduleName,
+					markdown: enhanced,
+					specs,
+					taskMap: packageIndex?.task_map ?? [],
+					relatedPages,
+					moduleSummary: moduleEntry.summary,
+					origin: url.origin,
+					basePath,
+				})
+			: null;
+		const guideSynopsis = guideEntry
+			? buildGuideSynopsis({
+					title: guideEntry.title,
+					markdown: enhanced,
+				})
+			: null;
 		const warnings = extractWarnings(enhanced);
 		const warningsSection = warnings.length
 			? ["## Warnings", ...warnings.map((warning) => `- ${warning}`)].join("\n")
@@ -1599,7 +1664,7 @@ export const handleRequest = async (
 		const bodyParts = [
 			instructionHeader,
 			sourceSection,
-			moduleSynopsis,
+			guideSynopsis ?? moduleSynopsis,
 			warningsSection,
 			workflowSection,
 			enhanced,
