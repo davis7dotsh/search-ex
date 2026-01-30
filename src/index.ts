@@ -88,6 +88,31 @@ const parsePathContext = (pathname: string) => {
 	};
 };
 
+const buildHomePage = (origin: string) =>
+	[
+		"# Hex Docs Search Proxy",
+		"",
+		"This worker serves LLM-friendly, local mirrors of Hex docs with task maps, summaries, and extracted workflows.",
+		"",
+		"## Quick Start",
+		`- Base: ${origin}`,
+		`- Package index: ${origin}/{package}/index.json`,
+		`- LLM index: ${origin}/{package}/llms.txt`,
+		`- Module docs: ${origin}/{package}/{Module}.html or .md`,
+		`- Guide docs: ${origin}/{package}/{guide}.html`,
+		"",
+		"## Agent Instructions (copy into AGENTS.md)",
+		"```",
+		"# Elixir Hex docs browsing (local)",
+		"- Always start at: http://localhost:8787/ecto/Ecto.html",
+		"- Read the Navigation block to find `llms.txt` and `index.json`.",
+		"- Use `llms.txt` to pick a task map entrypoint before searching.",
+		"- For migrations, follow the ecto task map to ecto_sql (Ecto.Migration / Ecto.Migrator / mix ecto.*).",
+		"- Prefer `.md` pages for cleaner parsing; fall back to `.html` if needed.",
+		"- Stay on localhost URLs only (no external web browsing).",
+		"```",
+	].join("\n");
+
 const isVersionSegment = (version?: string) =>
 	Boolean(version && /^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$/.test(version));
 
@@ -210,6 +235,34 @@ const toMarkdownUrl = (url: string) =>
 			? url.replace(/\.html(\b|$)/, ".md")
 			: `${url}.md`;
 
+const preserveMarkdownCode = (markdown: string) => {
+	const blocks: string[] = [];
+	const inlines: string[] = [];
+	let output = markdown.replace(/```[\s\S]*?```/g, (match) => {
+		const token = `__CODE_BLOCK_${blocks.length}__`;
+		blocks.push(match);
+		return token;
+	});
+	output = output.replace(/`[^`\n]+`/g, (match) => {
+		const token = `__INLINE_CODE_${inlines.length}__`;
+		inlines.push(match);
+		return token;
+	});
+	const restore = (input: string) => {
+		let restored = input;
+		blocks.forEach((block, index) => {
+			const token = `__CODE_BLOCK_${index}__`;
+			restored = restored.split(token).join(block);
+		});
+		inlines.forEach((inline, index) => {
+			const token = `__INLINE_CODE_${index}__`;
+			restored = restored.split(token).join(inline);
+		});
+		return restored;
+	};
+	return { output, restore };
+};
+
 const htmlToMarkdown = (html: string) => {
 	let output = html;
 	output = output.replace(/<script[\s\S]*?<\/script>/gi, "");
@@ -249,7 +302,9 @@ const htmlToMarkdown = (html: string) => {
 			return text ? `[${text}](${href})` : href;
 		},
 	);
-	output = decodeHtmlEntities(output.replace(/<[^>]+>/g, ""));
+	const preserved = preserveMarkdownCode(output);
+	output = decodeHtmlEntities(preserved.output.replace(/<[^>]+>/g, ""));
+	output = preserved.restore(output);
 	return output.replace(/\n{3,}/g, "\n\n").trim();
 };
 
@@ -583,6 +638,54 @@ const buildTaskMap = ({
 	return tasksOut.filter((entry) => entry.entrypoints.length);
 };
 
+const crossPackageTaskMap = (packageName: string, origin: string) => {
+	if (packageName !== "ecto") {
+		return [];
+	}
+	const base = `${origin}/ecto_sql`;
+	return [
+		{
+			id: "migrations",
+			title: "Run database migrations",
+			description: "Create and apply schema changes safely.",
+			entrypoints: [
+				{ label: "Ecto.Migration", url: `${base}/Ecto.Migration.html` },
+				{ label: "Ecto.Migrator", url: `${base}/Ecto.Migrator.html` },
+				{
+					label: "mix ecto.gen.migration",
+					url: `${base}/Mix.Tasks.Ecto.Gen.Migration.html`,
+				},
+				{
+					label: "mix ecto.migrate",
+					url: `${base}/Mix.Tasks.Ecto.Migrate.html`,
+				},
+				{
+					label: "mix ecto.rollback",
+					url: `${base}/Mix.Tasks.Ecto.Rollback.html`,
+				},
+			],
+		},
+	];
+};
+
+const mergeTaskMaps = (taskMap: TaskMapEntry[], extras: TaskMapEntry[]) => {
+	if (!extras.length) {
+		return taskMap;
+	}
+	const seenIds = new Set(taskMap.map((task) => task.id));
+	const seenTitles = new Set(taskMap.map((task) => task.title));
+	const merged = [...taskMap];
+	for (const extra of extras) {
+		if (seenIds.has(extra.id) || seenTitles.has(extra.title)) {
+			continue;
+		}
+		merged.push(extra);
+		seenIds.add(extra.id);
+		seenTitles.add(extra.title);
+	}
+	return merged;
+};
+
 const fetchUpstream = (fetcher: typeof fetch, url: URL, ttlSeconds: number) =>
 	fetcher(url, {
 		cf: {
@@ -684,6 +787,10 @@ const buildPackageIndex = async (
 			url: `${requestUrl.origin}${basePath}/${entry.id}.html`,
 		}),
 	);
+	const taskMap = mergeTaskMaps(
+		buildTaskMap({ modules, guides, tasks }),
+		crossPackageTaskMap(packageName, requestUrl.origin),
+	);
 	return {
 		package: packageName,
 		version,
@@ -698,7 +805,7 @@ const buildPackageIndex = async (
 		modules,
 		guides,
 		tasks,
-		task_map: buildTaskMap({ modules, guides, tasks }),
+		task_map: taskMap,
 		generated_at: new Date().toISOString(),
 	} satisfies PackageIndex;
 };
@@ -708,6 +815,11 @@ const getMarkdownFromPath = async (
 	fetcher: typeof fetch,
 	ttlSeconds: number,
 ) => {
+	const readMarkdownResponse = async (response: Response) => {
+		const text = await response.text();
+		const contentType = response.headers.get("content-type") ?? "";
+		return contentType.includes("text/html") ? htmlToMarkdown(text) : text;
+	};
 	const upstreamUrl = new URL(
 		`${requestUrl.pathname}${requestUrl.search}`,
 		UPSTREAM_ORIGIN,
@@ -719,7 +831,7 @@ const getMarkdownFromPath = async (
 		);
 		const response = await fetchUpstream(fetcher, upstreamUrl, ttlSeconds);
 		if (response.ok) {
-			return response.text();
+			return readMarkdownResponse(response);
 		}
 		const htmlResponse = await fetchUpstream(fetcher, htmlUrl, ttlSeconds);
 		if (htmlResponse.ok) {
@@ -748,7 +860,7 @@ const getMarkdownFromPath = async (
 			ttlSeconds,
 		);
 		if (markdownResponse.ok) {
-			return markdownResponse.text();
+			return readMarkdownResponse(markdownResponse);
 		}
 	}
 	return htmlToMarkdown(html);
@@ -798,6 +910,19 @@ const extractCodeBlocks = (markdown: string) => {
 		blocks.push(match[1]);
 	}
 	return blocks;
+};
+
+const extractReleaseCommands = (markdown: string) => {
+	for (const block of extractCodeBlocks(markdown)) {
+		const commands = block
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.startsWith("bin/") && line.includes("eval"));
+		if (commands.length) {
+			return commands.slice(0, 2);
+		}
+	}
+	return [];
 };
 
 const parseTypeOptions = (markdown: string) => {
@@ -949,6 +1074,21 @@ const extractWarnings = (markdown: string) => {
 
 const buildOperationalWorkflow = (markdown: string) => {
 	const steps: string[] = [];
+	const migrationsPathMatch = markdown.match(
+		/priv\/[^\s"'`]*migrations/gi,
+	)?.[0];
+	const overrides = [
+		markdown.includes(":priv") ? "`:priv` repo config" : null,
+		markdown.includes("--migrations-path") ? "`--migrations-path` CLI" : null,
+	].filter((entry): entry is string => Boolean(entry));
+	if (migrationsPathMatch) {
+		const overrideText = overrides.length
+			? ` (override via ${overrides.join(" or ")})`
+			: "";
+		steps.push(
+			`- Default migrations path: \`${migrationsPathMatch}\`${overrideText}.`,
+		);
+	}
 	if (markdown.includes("mix ecto.gen.migration")) {
 		steps.push("- Generate a migration: `mix ecto.gen.migration <name>`.");
 	}
@@ -968,6 +1108,15 @@ const buildOperationalWorkflow = (markdown: string) => {
 		steps.push(
 			"- For releases, run migrations via `Ecto.Migrator` in a release module.",
 		);
+	}
+	const releaseCommands = extractReleaseCommands(markdown);
+	if (releaseCommands.length) {
+		const formatted = releaseCommands.map((command) => `\`${command}\``);
+		const joined =
+			formatted.length === 2
+				? `${formatted[0]} and ${formatted[1]}`
+				: formatted[0];
+		steps.push(`- Release invoke examples: ${joined}.`);
 	}
 	return steps.length ? ["## Operational Workflow", ...steps].join("\n") : null;
 };
@@ -1258,6 +1407,9 @@ export const handleRequest = async (
 	fetcher: typeof fetch = fetch,
 ) => {
 	const url = new URL(request.url);
+	if (url.pathname === "/" || url.pathname === "") {
+		return markdownResponse(buildHomePage(url.origin), HOUR_TTL_SECONDS);
+	}
 	const { packageName, version, restPath, basePath } = parsePathContext(
 		url.pathname,
 	);
