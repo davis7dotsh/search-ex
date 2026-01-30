@@ -104,12 +104,12 @@ const buildHomePage = (origin: string) =>
 		"## Agent Instructions (copy into AGENTS.md)",
 		"```",
 		"# Elixir Hex docs browsing (local)",
-		"- Always start at: http://localhost:8787/ecto/Ecto.html",
+		`- Always start at: ${origin}/ecto/Ecto.html`,
 		"- Read the Navigation block to find `llms.txt` and `index.json`.",
 		"- Use `llms.txt` to pick a task map entrypoint before searching.",
 		"- For migrations, follow the ecto task map to ecto_sql (Ecto.Migration / Ecto.Migrator / mix ecto.*).",
 		"- Prefer `.md` pages for cleaner parsing; fall back to `.html` if needed.",
-		"- Stay on localhost URLs only (no external web browsing).",
+		"- Stay on origin URLs only (no external web browsing).",
 		"```",
 	].join("\n");
 
