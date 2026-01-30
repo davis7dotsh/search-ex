@@ -188,6 +188,92 @@ const decodeHtmlEntities = (input: string) =>
 const stripTags = (input: string) =>
 	decodeHtmlEntities(input.replace(/<[^>]*>/g, ""));
 
+const sliceHtmlTagBlock = (
+	html: string,
+	startIndex: number,
+	tagName: string,
+) => {
+	let depth = 0;
+	let index = startIndex;
+	while (index < html.length) {
+		const nextOpen = html.indexOf(`<${tagName}`, index);
+		const nextClose = html.indexOf(`</${tagName}`, index);
+		if (nextOpen !== -1 && (nextClose === -1 || nextOpen < nextClose)) {
+			depth += 1;
+			index = nextOpen + 1;
+			continue;
+		}
+		if (nextClose !== -1) {
+			depth -= 1;
+			const end = html.indexOf(">", nextClose);
+			if (depth <= 0 && end !== -1) {
+				return html.slice(startIndex, end + 1);
+			}
+			index = end === -1 ? nextClose + 1 : end + 1;
+			continue;
+		}
+		break;
+	}
+	return html.slice(startIndex);
+};
+
+const removeHtmlTagBlock = (
+	html: string,
+	startIndex: number,
+	tagName: string,
+) => {
+	const block = sliceHtmlTagBlock(html, startIndex, tagName);
+	return block ? html.replace(block, "") : html;
+};
+
+const isHexdocsHtml = (html: string) =>
+	/\bExDoc\b/.test(html) || html.includes("hexdocs.pm");
+
+const extractHexdocsContent = (html: string) => {
+	if (!isHexdocsHtml(html)) {
+		return html;
+	}
+	const contentMatch = html.match(/<div[^>]*id=["']content["'][^>]*>/i);
+	if (contentMatch?.index !== undefined) {
+		return sliceHtmlTagBlock(html, contentMatch.index, "div");
+	}
+	const mainMatch = html.match(/<main[^>]*id=["']main["'][^>]*>/i);
+	if (mainMatch?.index !== undefined) {
+		return sliceHtmlTagBlock(html, mainMatch.index, "main");
+	}
+	return html;
+};
+
+const stripHexdocsChrome = (html: string) => {
+	if (!isHexdocsHtml(html)) {
+		return html;
+	}
+	const patterns: Array<{ tag: string; regex: RegExp }> = [
+		{
+			tag: "div",
+			regex: /<div[^>]*class=["'][^"']*top-search[^"']*["'][^>]*>/i,
+		},
+		{
+			tag: "div",
+			regex: /<div[^>]*class=["'][^"']*page-options[^"']*["'][^>]*>/i,
+		},
+		{
+			tag: "div",
+			regex: /<div[^>]*class=["'][^"']*page-actions[^"']*["'][^>]*>/i,
+		},
+	];
+	let output = html;
+	for (const { tag, regex } of patterns) {
+		let match = regex.exec(output);
+		while (match?.index !== undefined) {
+			output = removeHtmlTagBlock(output, match.index, tag);
+			regex.lastIndex = 0;
+			match = regex.exec(output);
+		}
+	}
+	return output;
+};
+
 const normalizeLinkTarget = (
 	href: string,
 	baseUrl: string,
@@ -264,7 +350,8 @@ const preserveMarkdownCode = (markdown: string) => {
 };
 
 const htmlToMarkdown = (html: string) => {
-	let output = html;
+	let output = extractHexdocsContent(html);
+	output = stripHexdocsChrome(output);
 	output = output.replace(/<script[\s\S]*?<\/script>/gi, "");
 	output = output.replace(/<style[\s\S]*?<\/style>/gi, "");
 	output = output.replace(/<!--[\s\S]*?-->/g, "");
